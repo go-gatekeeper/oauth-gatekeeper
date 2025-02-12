@@ -470,13 +470,7 @@ func (r *fakeAuthServer) userInfoHandler(wrt http.ResponseWriter, req *http.Requ
 		return
 	}
 
-	token, err := jwt.ParseSigned(items[1], constant.SignatureAlgs[:])
-	if err != nil {
-		wrt.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	user, err := session.ExtractIdentity(token)
+	user, err := session.ExtractIdentity(items[1])
 	if err != nil {
 		wrt.WriteHeader(http.StatusUnauthorized)
 		return
@@ -507,7 +501,7 @@ func (r *fakeAuthServer) tokenHandler(writer http.ResponseWriter, req *http.Requ
 	token.SetExpiration(expires)
 	refreshToken := NewTestToken(r.getLocation())
 	refreshToken.SetExpiration(refreshExpires)
-	refreshToken.Claims.Aud = r.getLocation()
+	refreshToken.Claims.Aud = defTestTokenClaims.Aud
 	codeVerifier := ""
 
 	if req.FormValue("grant_type") == configcore.GrantTypeUmaTicket {

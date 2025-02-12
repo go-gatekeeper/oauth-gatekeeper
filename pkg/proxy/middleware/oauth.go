@@ -31,11 +31,10 @@ func AuthenticationMiddleware(
 	logger *zap.Logger,
 	cookieAccessName string,
 	cookieRefreshName string,
-	getIdentity func(req *http.Request, tokenCookie string, tokenHeader string) (*models.UserContext, error),
+	getIdentity func(req *http.Request, tokenCookie string, tokenHeader string) (string, error),
 	httpClient *http.Client,
 	enableIDPSessionCheck bool,
 	provider *oidc3.Provider,
-	skipTokenVerification bool,
 	clientID string,
 	skipAccessTokenClientIDCheck bool,
 	skipAccessTokenIssuerCheck bool,
@@ -59,23 +58,19 @@ func AuthenticationMiddleware(
 			}
 
 			scope.Logger.Debug("authentication middleware")
+			lLog := scope.Logger.With(
+				zap.String("remote_addr", req.RemoteAddr),
+			)
 
+			ctx := context.WithValue(req.Context(), constant.ContextScopeName, scope)
 			// grab the user identity from the request
-			user, err := getIdentity(req, cookieAccessName, "")
+			token, err := getIdentity(req, cookieAccessName, "")
 			if err != nil {
 				scope.Logger.Error(err.Error())
 				core.RevokeProxy(logger, req)
 				next.ServeHTTP(wrt, req)
 				return
 			}
-
-			scope.Identity = user
-			ctx := context.WithValue(req.Context(), constant.ContextScopeName, scope)
-			lLog := scope.Logger.With(
-				zap.String("remote_addr", req.RemoteAddr),
-				zap.String("sub", user.ID),
-				zap.String("expired_on", user.ExpiresAt.String()),
-			)
 
 			// IMPORTANT: For all calls with go-oidc library be aware
 			// that calls accept context parameter and you have to pass
@@ -84,230 +79,248 @@ func AuthenticationMiddleware(
 			// https://github.com/coreos/go-oidc/issues/402
 			oidcLibCtx := context.WithValue(ctx, oauth2.HTTPClient, httpClient)
 
-			// step: skip if we are running skip-token-verification
-			if skipTokenVerification {
-				scope.Logger.Warn(
-					"skip token verification enabled, " +
-						"skipping verification - TESTING ONLY",
-				)
+			_, err = utils.VerifyToken(
+				ctx,
+				provider,
+				token,
+				clientID,
+				skipAccessTokenClientIDCheck,
+				skipAccessTokenIssuerCheck,
+			)
+			if err != nil {
+				if errors.Is(err, apperrors.ErrTokenSignature) {
+					lLog.Error(
+						apperrors.ErrAccTokenVerifyFailure.Error(),
+						zap.Error(err),
+					)
+					accessForbidden(wrt, req)
+					return
+				}
 
-				if user.IsExpired() {
-					lLog.Error(apperrors.ErrSessionExpiredVerifyOff.Error())
+				if !strings.Contains(err.Error(), "token is expired") {
+					lLog.Error(
+						apperrors.ErrAccTokenVerifyFailure.Error(),
+						zap.Error(err),
+					)
+					accessForbidden(wrt, req)
+					return
+				}
+
+				if !enableRefreshTokens {
+					lLog.Error(apperrors.ErrSessionExpiredRefreshOff.Error())
 					core.RevokeProxy(logger, req)
 					next.ServeHTTP(wrt, req)
 					return
 				}
-			} else {
-				_, err := utils.VerifyToken(
-					ctx,
-					provider,
-					user.RawToken,
-					clientID,
-					skipAccessTokenClientIDCheck,
-					skipAccessTokenIssuerCheck,
+
+				user, err := session.ExtractIdentity(token)
+				if err != nil {
+					lLog.Error(err.Error())
+					core.RevokeProxy(logger, req)
+					next.ServeHTTP(wrt, req)
+					return
+				}
+
+				logger.Debug("found the user identity",
+					zap.String("id", user.ID),
+					zap.String("name", user.Name),
+					zap.String("email", user.Email),
+					zap.String("roles", strings.Join(user.Roles, ",")),
+					zap.String("groups", strings.Join(user.Groups, ",")))
+
+				lLog.Info("accces token for user has expired, attemping to refresh the token")
+
+				// step: check if the user has refresh token
+				refresh, _, err := session.RetrieveRefreshToken(
+					store,
+					cookieRefreshName,
+					encryptionKey,
+					req.WithContext(ctx),
+					user,
 				)
 				if err != nil {
-					if errors.Is(err, apperrors.ErrTokenSignature) {
-						lLog.Error(
-							apperrors.ErrAccTokenVerifyFailure.Error(),
-							zap.Error(err),
-						)
-						accessForbidden(wrt, req)
-						return
-					}
-
-					if !strings.Contains(err.Error(), "token is expired") {
-						lLog.Error(
-							apperrors.ErrAccTokenVerifyFailure.Error(),
-							zap.Error(err),
-						)
-						accessForbidden(wrt, req)
-						return
-					}
-
-					if !enableRefreshTokens {
-						lLog.Error(apperrors.ErrSessionExpiredRefreshOff.Error())
-						core.RevokeProxy(logger, req)
-						next.ServeHTTP(wrt, req)
-						return
-					}
-
-					lLog.Info("accces token for user has expired, attemping to refresh the token")
-
-					// step: check if the user has refresh token
-					refresh, _, err := session.RetrieveRefreshToken(
-						store,
-						cookieRefreshName,
-						encryptionKey,
-						req.WithContext(ctx),
-						user,
+					scope.Logger.Error(
+						apperrors.ErrRefreshTokenNotFound.Error(),
+						zap.Error(err),
 					)
-					if err != nil {
-						scope.Logger.Error(
-							apperrors.ErrRefreshTokenNotFound.Error(),
-							zap.Error(err),
-						)
-						core.RevokeProxy(logger, req)
-						next.ServeHTTP(wrt, req)
-						return
-					}
-
-					var stdRefreshClaims *jwt.Claims
-					stdRefreshClaims, err = utils.ParseRefreshToken(refresh)
-					if err != nil {
-						lLog.Error(
-							apperrors.ErrParseRefreshToken.Error(),
-							zap.Error(err),
-						)
-						accessForbidden(wrt, req)
-						return
-					}
-					if user.ID != stdRefreshClaims.Subject {
-						lLog.Error(
-							apperrors.ErrAccRefreshTokenMismatch.Error(),
-							zap.Error(err),
-						)
-						accessForbidden(wrt, req)
-						return
-					}
-
-					// attempt to refresh the access token, possibly with a renewed refresh token
-					//
-					// NOTE: atm, this does not retrieve explicit refresh token expiry from oauth2,
-					// and take identity expiry instead: with keycloak, they are the same and equal to
-					// "SSO session idle" keycloak setting.
-					//
-					// exp: expiration of the access token
-					// expiresIn: expiration of the ID token
-					conf := newOAuth2Config(redirectionURL)
-
-					lLog.Debug(
-						"issuing refresh token request",
-						zap.String("current access token", user.RawToken),
-						zap.String("refresh token", refresh),
-					)
-
-					newAccToken, newRawAccToken, newRefreshToken, accessExpiresAt, refreshExpiresIn, err := utils.GetRefreshedToken(
-						ctx,
-						conf,
-						httpClient,
-						refresh,
-					)
-					if err != nil {
-						switch {
-						case errors.Is(err, apperrors.ErrRefreshTokenExpired):
-							lLog.Warn("refresh token has expired, cannot retrieve access token")
-							cookMgr.ClearAllCookies(req.WithContext(ctx), wrt)
-						default:
-							lLog.Debug(
-								apperrors.ErrAccTokenRefreshFailure.Error(),
-								zap.String("access token", user.RawToken),
-							)
-							lLog.Error(
-								apperrors.ErrAccTokenRefreshFailure.Error(),
-								zap.Error(err),
-							)
-						}
-
-						core.RevokeProxy(logger, req)
-						next.ServeHTTP(wrt, req)
-						return
-					}
-
-					lLog.Debug(
-						"info about tokens after refreshing",
-						zap.String("new access token", newRawAccToken),
-						zap.String("new refresh token", newRefreshToken),
-					)
-
-					accessExpiresIn := time.Until(accessExpiresAt)
-
-					if newRefreshToken != "" {
-						refresh = newRefreshToken
-					}
-
-					if refreshExpiresIn == 0 {
-						// refresh token expiry claims not available: try to parse refresh token
-						refreshExpiresIn = session.GetAccessCookieExpiration(lLog, accessTokenDuration, refresh)
-					}
-
-					lLog.Info(
-						"injecting the refreshed access token cookie",
-						zap.Duration("refresh_expires_in", refreshExpiresIn),
-						zap.Duration("expires_in", accessExpiresIn),
-					)
-
-					accessToken := newRawAccToken
-
-					if enableEncryptedToken || forceEncryptedCookie {
-						if accessToken, err = encryption.EncodeText(accessToken, encryptionKey); err != nil {
-							lLog.Error(
-								apperrors.ErrEncryptAccToken.Error(),
-								zap.Error(err),
-							)
-							accessForbidden(wrt, req)
-							return
-						}
-					}
-
-					// step: inject the refreshed access token
-					cookMgr.DropAccessTokenCookie(req.WithContext(ctx), wrt, accessToken, accessExpiresIn)
-
-					// update the with the new access token and inject into the context
-					newUser, err := session.ExtractIdentity(&newAccToken)
-					if err != nil {
-						lLog.Error(err.Error())
-						accessForbidden(wrt, req)
-						return
-					}
-
-					// step: inject the renewed refresh token
-					if newRefreshToken != "" {
-						lLog.Debug(
-							"renew refresh cookie with new refresh token",
-							zap.Duration("refresh_expires_in", refreshExpiresIn),
-						)
-						var encryptedRefreshToken string
-						encryptedRefreshToken, err = encryption.EncodeText(newRefreshToken, encryptionKey)
-						if err != nil {
-							lLog.Error(
-								apperrors.ErrEncryptRefreshToken.Error(),
-								zap.Error(err),
-							)
-							wrt.WriteHeader(http.StatusInternalServerError)
-							return
-						}
-
-						if store != nil {
-							go func(ctx context.Context, old string, newToken string, encrypted string) {
-								ctxx, cancel := context.WithCancel(ctx)
-								defer cancel()
-								if err = store.Delete(ctxx, utils.GetHashKey(old)); err != nil {
-									lLog.Error(
-										apperrors.ErrDelTokFromStore.Error(),
-										zap.Error(err),
-									)
-								}
-
-								if err = store.Set(ctxx, utils.GetHashKey(newToken), encrypted, refreshExpiresIn); err != nil {
-									lLog.Error(
-										apperrors.ErrSaveTokToStore.Error(),
-										zap.Error(err),
-									)
-									return
-								}
-							}(ctx, user.RawToken, newRawAccToken, encryptedRefreshToken)
-						} else {
-							cookMgr.DropRefreshTokenCookie(req.WithContext(ctx), wrt, encryptedRefreshToken, refreshExpiresIn)
-						}
-					}
-
-					// IMPORTANT: on this rely other middlewares, must be refreshed
-					// with new identity!
-					newUser.RawToken = newRawAccToken
-					scope.Identity = newUser
-					ctx = context.WithValue(req.Context(), constant.ContextScopeName, scope)
+					core.RevokeProxy(logger, req)
+					next.ServeHTTP(wrt, req)
+					return
 				}
+
+				var stdRefreshClaims *jwt.Claims
+				stdRefreshClaims, err = utils.ParseRefreshToken(refresh)
+				if err != nil {
+					lLog.Error(
+						apperrors.ErrParseRefreshToken.Error(),
+						zap.Error(err),
+					)
+					accessForbidden(wrt, req)
+					return
+				}
+				if user.ID != stdRefreshClaims.Subject {
+					lLog.Error(
+						apperrors.ErrAccRefreshTokenMismatch.Error(),
+						zap.Error(err),
+					)
+					accessForbidden(wrt, req)
+					return
+				}
+
+				scope.Identity = user
+
+				// attempt to refresh the access token, possibly with a renewed refresh token
+				//
+				// NOTE: atm, this does not retrieve explicit refresh token expiry from oauth2,
+				// and take identity expiry instead: with keycloak, they are the same and equal to
+				// "SSO session idle" keycloak setting.
+				//
+				// exp: expiration of the access token
+				// expiresIn: expiration of the ID token
+				conf := newOAuth2Config(redirectionURL)
+
+				lLog.Debug(
+					"issuing refresh token request",
+					zap.String("current access token", user.RawToken),
+					zap.String("refresh token", refresh),
+				)
+
+				_, newRawAccToken, newRefreshToken, accessExpiresAt, refreshExpiresIn, err := utils.GetRefreshedToken(
+					ctx,
+					conf,
+					httpClient,
+					refresh,
+				)
+				if err != nil {
+					switch {
+					case errors.Is(err, apperrors.ErrRefreshTokenExpired):
+						lLog.Warn("refresh token has expired, cannot retrieve access token")
+						cookMgr.ClearAllCookies(req.WithContext(ctx), wrt)
+					default:
+						lLog.Debug(
+							apperrors.ErrAccTokenRefreshFailure.Error(),
+							zap.String("access token", user.RawToken),
+						)
+						lLog.Error(
+							apperrors.ErrAccTokenRefreshFailure.Error(),
+							zap.Error(err),
+						)
+					}
+
+					core.RevokeProxy(logger, req)
+					next.ServeHTTP(wrt, req)
+					return
+				}
+
+				lLog.Debug(
+					"info about tokens after refreshing",
+					zap.String("new access token", newRawAccToken),
+					zap.String("new refresh token", newRefreshToken),
+				)
+
+				accessExpiresIn := time.Until(accessExpiresAt)
+
+				if newRefreshToken != "" {
+					refresh = newRefreshToken
+				}
+
+				if refreshExpiresIn == 0 {
+					// refresh token expiry claims not available: try to parse refresh token
+					refreshExpiresIn = session.GetAccessCookieExpiration(lLog, accessTokenDuration, refresh)
+				}
+
+				lLog.Info(
+					"injecting the refreshed access token cookie",
+					zap.Duration("refresh_expires_in", refreshExpiresIn),
+					zap.Duration("expires_in", accessExpiresIn),
+				)
+
+				accessToken := newRawAccToken
+				// update the with the new access token and inject into the context
+				newUser, err := session.ExtractIdentity(accessToken)
+				if err != nil {
+					lLog.Error(err.Error())
+					accessForbidden(wrt, req)
+					return
+				}
+
+				if enableEncryptedToken || forceEncryptedCookie {
+					if accessToken, err = encryption.EncodeText(accessToken, encryptionKey); err != nil {
+						lLog.Error(
+							apperrors.ErrEncryptAccToken.Error(),
+							zap.Error(err),
+						)
+						accessForbidden(wrt, req)
+						return
+					}
+				}
+
+				// step: inject the refreshed access token
+				cookMgr.DropAccessTokenCookie(req.WithContext(ctx), wrt, accessToken, accessExpiresIn)
+
+				// step: inject the renewed refresh token
+				if newRefreshToken != "" {
+					lLog.Debug(
+						"renew refresh cookie with new refresh token",
+						zap.Duration("refresh_expires_in", refreshExpiresIn),
+					)
+					var encryptedRefreshToken string
+					encryptedRefreshToken, err = encryption.EncodeText(newRefreshToken, encryptionKey)
+					if err != nil {
+						lLog.Error(
+							apperrors.ErrEncryptRefreshToken.Error(),
+							zap.Error(err),
+						)
+						wrt.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+
+					if store != nil {
+						go func(ctx context.Context, old string, newToken string, encrypted string) {
+							ctxx, cancel := context.WithCancel(ctx)
+							defer cancel()
+							if err = store.Delete(ctxx, utils.GetHashKey(old)); err != nil {
+								lLog.Error(
+									apperrors.ErrDelTokFromStore.Error(),
+									zap.Error(err),
+								)
+							}
+
+							if err = store.Set(ctxx, utils.GetHashKey(newToken), encrypted, refreshExpiresIn); err != nil {
+								lLog.Error(
+									apperrors.ErrSaveTokToStore.Error(),
+									zap.Error(err),
+								)
+								return
+							}
+						}(ctx, user.RawToken, newRawAccToken, encryptedRefreshToken)
+					} else {
+						cookMgr.DropRefreshTokenCookie(req.WithContext(ctx), wrt, encryptedRefreshToken, refreshExpiresIn)
+					}
+				}
+
+				// IMPORTANT: on this rely other middlewares, must be refreshed
+				// with new identity!
+				newUser.RawToken = newRawAccToken
+				scope.Identity = newUser
+				ctx = context.WithValue(req.Context(), constant.ContextScopeName, scope)
+			} else {
+				user, err := session.ExtractIdentity(token)
+				if err != nil {
+					lLog.Error(err.Error())
+					core.RevokeProxy(logger, req)
+					next.ServeHTTP(wrt, req)
+					return
+				}
+
+				logger.Debug("found the user identity",
+					zap.String("id", user.ID),
+					zap.String("name", user.Name),
+					zap.String("email", user.Email),
+					zap.String("roles", strings.Join(user.Roles, ",")),
+					zap.String("groups", strings.Join(user.Groups, ",")))
+
+				scope.Identity = user
 			}
 
 			if enableIDPSessionCheck {
@@ -335,7 +348,6 @@ func AuthenticationMiddleware(
 func RedirectToAuthorizationMiddleware(
 	logger *zap.Logger,
 	cookManager *cookie.Manager,
-	skipTokenVerification bool,
 	noProxy bool,
 	baseURI string,
 	oAuthURI string,
@@ -374,17 +386,6 @@ func RedirectToAuthorizationMiddleware(
 						}
 					}
 					authQuery += query
-				}
-
-				// step: if verification is switched off, we can't authorization
-				if skipTokenVerification {
-					logger.Error(
-						"refusing to redirection to authorization endpoint, " +
-							"skip token verification switched on",
-					)
-
-					wrt.WriteHeader(http.StatusForbidden)
-					return
 				}
 
 				url := utils.WithOAuthURI(baseURI, oAuthURI)(constant.AuthorizationURL + authQuery)

@@ -197,24 +197,18 @@ func WithUMAIdentity(
 	clientID string,
 	skipClientIDCheck bool,
 	skipIssuerCheck bool,
-	getIdentity func(req *http.Request, tokenCookie string, tokenHeader string) (*models.UserContext, error),
+	getIdentity func(req *http.Request, tokenCookie string, tokenHeader string) (string, error),
 	authzFunc func(targetPath string, userPerms models.Permissions) (authorization.AuthzDecision, error),
 ) (authorization.AuthzDecision, error) {
-	umaUser, err := getIdentity(req, cookieUMAName, constant.UMAHeader)
+	token, err := getIdentity(req, cookieUMAName, constant.UMAHeader)
 	if err != nil {
 		return authorization.DeniedAuthz, err
-	}
-
-	// make sure somebody doesn't sent one user access token
-	// and others user valid uma token in one request
-	if umaUser.ID != user.ID {
-		return authorization.DeniedAuthz, apperrors.ErrAccessMismatchUmaToken
 	}
 
 	_, err = utils.VerifyToken(
 		req.Context(),
 		provider,
-		umaUser.RawToken,
+		token,
 		clientID,
 		skipClientIDCheck,
 		skipIssuerCheck,
@@ -224,6 +218,17 @@ func WithUMAIdentity(
 			return authorization.DeniedAuthz, apperrors.ErrUMATokenExpired
 		}
 		return authorization.DeniedAuthz, err
+	}
+
+	umaUser, err := session.ExtractIdentity(token)
+	if err != nil {
+		return authorization.DeniedAuthz, err
+	}
+
+	// make sure somebody doesn't sent one user access token
+	// and others user valid uma token in one request
+	if umaUser.ID != user.ID {
+		return authorization.DeniedAuthz, apperrors.ErrAccessMismatchUmaToken
 	}
 
 	return authzFunc(targetPath, umaUser.Permissions)
@@ -357,16 +362,10 @@ func refreshUmaToken(
 		return nil, err
 	}
 
-	token, err := jwt.ParseSigned(tok.AccessToken, constant.SignatureAlgs[:])
+	umaUser, err := session.ExtractIdentity(tok.AccessToken)
 	if err != nil {
 		return nil, err
 	}
 
-	umaUser, err := session.ExtractIdentity(token)
-	if err != nil {
-		return nil, err
-	}
-
-	umaUser.RawToken = tok.AccessToken
 	return umaUser, nil
 }

@@ -127,62 +127,45 @@ func GetTokenInCookie(req *http.Request, name string) (string, error) {
 
 // GetIdentity retrieves the user identity from a request, either from a session cookie or a bearer token.
 func GetIdentity(
-	logger *zap.Logger,
 	skipAuthorizationHeaderIdentity bool,
 	enableEncryptedToken bool,
 	forceEncryptedCookie bool,
 	encKey string,
-) func(req *http.Request, tokenCookie string, tokenHeader string) (*models.UserContext, error) {
-	return func(req *http.Request, tokenCookie string, tokenHeader string) (*models.UserContext, error) {
+) func(req *http.Request, tokenCookie string, tokenHeader string) (string, error) {
+	return func(req *http.Request, tokenCookie string, tokenHeader string) (string, error) {
 		var isBearer bool
 		// step: check for a bearer token or cookie with jwt token
-		access, isBearer, err := GetTokenInRequest(
+		token, isBearer, err := GetTokenInRequest(
 			req,
 			tokenCookie,
 			skipAuthorizationHeaderIdentity,
 			tokenHeader,
 		)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 
 		if enableEncryptedToken || forceEncryptedCookie && !isBearer {
-			if access, err = encryption.DecodeText(access, encKey); err != nil {
-				return nil, apperrors.ErrDecryption
+			if token, err = encryption.DecodeText(token, encKey); err != nil {
+				return "", apperrors.ErrDecryption
 			}
 		}
 
-		rawToken := access
-		token, err := jwt.ParseSigned(access, constant.SignatureAlgs[:])
-		if err != nil {
-			return nil, err
-		}
-
-		user, err := ExtractIdentity(token)
-		if err != nil {
-			return nil, err
-		}
-
-		user.BearerToken = isBearer
-		user.RawToken = rawToken
-
-		logger.Debug("found the user identity",
-			zap.String("id", user.ID),
-			zap.String("name", user.Name),
-			zap.String("email", user.Email),
-			zap.String("roles", strings.Join(user.Roles, ",")),
-			zap.String("groups", strings.Join(user.Groups, ",")))
-
-		return user, nil
+		return token, nil
 	}
 }
 
 // ExtractIdentity parse the jwt token and extracts the various elements is order to construct.
-func ExtractIdentity(token *jwt.JSONWebToken) (*models.UserContext, error) {
+func ExtractIdentity(rawToken string) (*models.UserContext, error) {
+	token, err := jwt.ParseSigned(rawToken, constant.SignatureAlgs[:])
+	if err != nil {
+		return nil, err
+	}
+
 	stdClaims := &jwt.Claims{}
 	customClaims := models.CustClaims{}
 
-	err := token.UnsafeClaimsWithoutVerification(stdClaims, &customClaims)
+	err = token.UnsafeClaimsWithoutVerification(stdClaims, &customClaims)
 	if err != nil {
 		return nil, err
 	}
@@ -238,6 +221,7 @@ func ExtractIdentity(token *jwt.JSONWebToken) (*models.UserContext, error) {
 		Roles:         roleList,
 		Claims:        jsonMap,
 		Permissions:   customClaims.Authorization,
+		RawToken:      rawToken,
 	}, nil
 }
 
@@ -279,12 +263,7 @@ func GetAccessCookieExpiration(
 	// refresh token
 	duration := accessTokenDuration
 
-	webToken, err := jwt.ParseSigned(refresh, constant.SignatureAlgs[:])
-	if err != nil {
-		logger.Error("unable to parse token")
-	}
-
-	if ident, err := ExtractIdentity(webToken); err == nil {
+	if ident, err := ExtractIdentity(refresh); err == nil {
 		delta := time.Until(ident.ExpiresAt)
 
 		if delta > 0 {

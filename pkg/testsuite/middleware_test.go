@@ -70,7 +70,7 @@ func TestMetricsMiddleware(t *testing.T) {
 		},
 		{
 			URI:           FakeAuthAllURL,
-			Redirects:     false,
+			Redirects:     true,
 			ExpectedProxy: true,
 			ExpectedCode:  http.StatusOK,
 		},
@@ -1278,7 +1278,7 @@ func TestRolePermissionsMiddleware(t *testing.T) {
 					HasToken:     true,
 					NotSigned:    true,
 					Roles:        []string{FakeTestRole},
-					ExpectedCode: http.StatusUnauthorized,
+					ExpectedCode: http.StatusForbidden,
 				},
 				{ // check with correct token, signed
 					URI:          "/admin/page",
@@ -1653,12 +1653,7 @@ func checkAccessTokenEncryption(t *testing.T, cfg *config.Config, value string) 
 		return false
 	}
 
-	token, err := jwt.ParseSigned(rawToken, constant.SignatureAlgs[:])
-	if err != nil {
-		return false
-	}
-
-	user, err := session.ExtractIdentity(token)
+	user, err := session.ExtractIdentity(rawToken)
 	if err != nil {
 		return false
 	}

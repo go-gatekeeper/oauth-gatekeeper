@@ -136,12 +136,6 @@ func NewProxy(config *config.Config, log *zap.Logger, upstream core.ReverseProxy
 
 	svc.Log.Info("successfully retrieved openid configuration from the discovery")
 
-	if config.SkipTokenVerification {
-		log.Warn(
-			"TESTING ONLY CONFIG - access token verification has been disabled",
-		)
-	}
-
 	if config.ClientID == "" && config.ClientSecret == "" {
 		log.Warn(
 			"client credentials are not set, depending on " +
@@ -335,7 +329,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 	)
 
 	getIdentity := session.GetIdentity(
-		r.Log,
 		r.Config.SkipAuthorizationHeaderIdentity,
 		r.Config.EnableEncryptedToken,
 		r.Config.ForceEncryptedCookie,
@@ -422,7 +415,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 		r.IdpClient.RestyClient().GetClient(),
 		r.Config.EnableIDPSessionCheck,
 		r.Provider,
-		r.Config.SkipTokenVerification,
 		r.Config.ClientID,
 		r.Config.SkipAccessTokenClientIDCheck,
 		r.Config.SkipAccessTokenIssuerCheck,
@@ -461,7 +453,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 		r.Config.RedirectionURL,
 		r.Config.DiscoveryURL,
 		r.Config.RevocationEndpoint,
-		r.Config.CookieAccessName,
 		r.Config.CookieIDTokenName,
 		r.Config.CookieRefreshName,
 		r.Config.ClientID,
@@ -473,8 +464,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 		r.Store,
 		r.Cm,
 		r.IdpClient.RestyClient().GetClient(),
-		accessError,
-		getIdentity,
 	)
 
 	if r.Config.EnablePKCE {
@@ -489,7 +478,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 		r.Config.CookieRequestURIName,
 		r.Config.PostLoginRedirectPath,
 		r.Config.EncryptionKey,
-		r.Config.SkipTokenVerification,
 		r.Config.SkipAccessTokenClientIDCheck,
 		r.Config.SkipAccessTokenIssuerCheck,
 		r.Config.EnableRefreshTokens,
@@ -512,7 +500,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 
 	oauthAuthorizationHand := oauthAuthorizationHandler(
 		r.Log,
-		r.Config.SkipTokenVerification,
 		r.Config.Scopes,
 		r.Config.EnablePKCE,
 		false,
@@ -531,7 +518,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 	if r.Config.EnableRegisterHandler {
 		oauthRegistrationHand = oauthAuthorizationHandler(
 			r.Log,
-			r.Config.SkipTokenVerification,
 			r.Config.Scopes,
 			r.Config.EnablePKCE,
 			r.Config.EnableRegisterHandler,
@@ -550,7 +536,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 	redToAuthMiddleware := gmiddleware.RedirectToAuthorizationMiddleware(
 		r.Log,
 		r.Cm,
-		r.Config.SkipTokenVerification,
 		r.Config.NoProxy,
 		r.Config.BaseURI,
 		r.Config.OAuthURI,
@@ -567,28 +552,38 @@ func (r *OauthProxy) CreateReverseProxy() error {
 	}
 
 	// step: add the routing for oauth
-	engine.With(gmiddleware.ProxyDenyMiddleware(r.Log)).Route(r.Config.BaseURI+r.Config.OAuthURI, func(eng chi.Router) {
-		eng.MethodNotAllowed(handlers.MethodNotAllowHandlder)
-		eng.HandleFunc(constant.AuthorizationURL, oauthAuthorizationHand)
-		if r.Config.EnableRegisterHandler {
-			eng.HandleFunc(constant.RegistrationURL, oauthRegistrationHand)
-		}
-		eng.Get(constant.CallbackURL, oauthCallbackHand)
-		eng.Get(constant.ExpiredURL, handlers.ExpirationHandler(getIdentity, r.Config.CookieAccessName))
-		eng.With(authMid, authFailMiddleware).Get(constant.LogoutURL, logoutHand)
-		eng.With(authMid, authFailMiddleware).Get(
-			constant.TokenURL,
-			handlers.TokenHandler(getIdentity, r.Config.CookieAccessName, accessError),
-		)
-		eng.Post(constant.LoginURL, loginHand)
-		eng.Get(constant.DiscoveryURL, handlers.DiscoveryHandler(r.Log, WithOAuthURI))
+	engine.With(gmiddleware.ProxyDenyMiddleware(r.Log)).
+		Route(r.Config.BaseURI+r.Config.OAuthURI, func(eng chi.Router) {
+			eng.MethodNotAllowed(handlers.MethodNotAllowHandlder)
+			eng.HandleFunc(constant.AuthorizationURL, oauthAuthorizationHand)
+			if r.Config.EnableRegisterHandler {
+				eng.HandleFunc(constant.RegistrationURL, oauthRegistrationHand)
+			}
+			eng.Get(constant.CallbackURL, oauthCallbackHand)
+			eng.Get(constant.ExpiredURL, handlers.ExpirationHandler(
+				r.Log,
+				r.Provider,
+				r.Config.ClientID,
+				r.Config.SkipAccessTokenClientIDCheck,
+				r.Config.SkipAccessTokenIssuerCheck,
+				getIdentity,
+				r.Config.CookieAccessName,
+			),
+			)
+			eng.With(authMid, authFailMiddleware).Get(constant.LogoutURL, logoutHand)
+			eng.With(authMid, authFailMiddleware).Get(
+				constant.TokenURL,
+				handlers.TokenHandler(getIdentity, r.Config.CookieAccessName, accessError),
+			)
+			eng.Post(constant.LoginURL, loginHand)
+			eng.Get(constant.DiscoveryURL, handlers.DiscoveryHandler(r.Log, WithOAuthURI))
 
-		if r.Config.ListenAdmin == "" {
-			eng.Mount("/", adminEngine)
-		}
+			if r.Config.ListenAdmin == "" {
+				eng.Mount("/", adminEngine)
+			}
 
-		eng.NotFound(http.NotFound)
-	})
+			eng.NotFound(http.NotFound)
+		})
 
 	// step: define profiling subrouter
 	var debugEngine chi.Router
@@ -721,7 +716,6 @@ func (r *OauthProxy) CreateReverseProxy() error {
 		if r.Config.EnableLoA && !res.NoRedirect {
 			loAMid = levelOfAuthenticationMiddleware(
 				r.Log,
-				r.Config.SkipTokenVerification,
 				r.Config.Scopes,
 				r.Config.EnablePKCE,
 				r.Config.SignInPage,

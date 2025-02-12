@@ -172,7 +172,6 @@ type Config struct {
 	EnableHmac                      bool `env:"Enable_HMAC" json:"enable-hmac" usage:"enable creating hmac for forwarded requests and verification on incoming requests"`
 	NoProxy                         bool `env:"NO_PROXY" json:"no-proxy" usage:"do not proxy requests to upstream, useful for forward-auth usage (with nginx, traefik)" yaml:"no-proxy"`
 	NoRedirects                     bool `env:"NO_REDIRECTS" json:"no-redirects" usage:"do not have back redirects when no authentication is present, 401 them" yaml:"no-redirects"`
-	SkipTokenVerification           bool `env:"SKIP_TOKEN_VERIFICATION" json:"skip-token-verification" usage:"TESTING ONLY; bypass token verification, only expiration and roles enforced" yaml:"skip-token-verification"`
 	SkipAccessTokenIssuerCheck      bool `env:"SKIP_ACCESS_TOKEN_ISSUER_CHECK" json:"skip-access-token-issuer-check" usage:"according RFC issuer should not be checked on access token, this will be default true in future" yaml:"skip-access-token-issuer-check"`
 	SkipAccessTokenClientIDCheck    bool `env:"SKIP_ACCESS_TOKEN_CLIENT_ID_CHECK" json:"skip-access-token-clientid-check" usage:"according RFC client id should not be checked on access token, this will be default true in future" yaml:"skip-access-token-clientid-check"`
 	SkipAuthorizationHeaderIdentity bool `env:"SKIP_AUTHORIZATION_HEADER_IDENTITY" json:"skip-authorization-header-identity" usage:"skip authorization header identity, means that we won't be extracting token from authorization header (e.g. if authorization header is used only by application behind gatekeeper)" yaml:"skip-authorization-header-identity"`
@@ -571,24 +570,22 @@ func (r *Config) isReverseProxySettingsValid() error {
 
 func (r *Config) isTokenVerificationSettingsValid() error {
 	// step: if the skip verification is off, we need the below
-	if !r.SkipTokenVerification {
-		validationRegistry := []func() error{
-			r.isClientIDValid,
-			r.isDiscoveryURLValid,
-			func() error {
-				r.RedirectionURL = strings.TrimSuffix(r.RedirectionURL, "/")
-				return nil
-			},
-			r.isSecurityFilterValid,
-			r.isTokenEncryptionValid,
-			r.isSecureCookieValid,
-			r.isStoreURLValid,
-		}
+	validationRegistry := []func() error{
+		r.isClientIDValid,
+		r.isDiscoveryURLValid,
+		func() error {
+			r.RedirectionURL = strings.TrimSuffix(r.RedirectionURL, "/")
+			return nil
+		},
+		r.isSecurityFilterValid,
+		r.isTokenEncryptionValid,
+		r.isSecureCookieValid,
+		r.isStoreURLValid,
+	}
 
-		for _, validationFunc := range validationRegistry {
-			if err := validationFunc(); err != nil {
-				return err
-			}
+	for _, validationFunc := range validationRegistry {
+		if err := validationFunc(); err != nil {
+			return err
 		}
 	}
 

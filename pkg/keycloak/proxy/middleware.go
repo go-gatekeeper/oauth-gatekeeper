@@ -64,7 +64,7 @@ func authorizationMiddleware(
 	clientID string,
 	skipClientIDCheck bool,
 	skipIssuerCheck bool,
-	getIdentity func(req *http.Request, tokenCookie string, tokenHeader string) (*models.UserContext, error),
+	getIdentity func(req *http.Request, tokenCookie string, tokenHeader string) (string, error),
 	accessForbidden func(wrt http.ResponseWriter, req *http.Request) context.Context,
 ) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -255,7 +255,6 @@ func authorizationMiddleware(
 
 func levelOfAuthenticationMiddleware(
 	logger *zap.Logger,
-	skipTokenVerification bool,
 	scopes []string,
 	enablePKCE bool,
 	signInPage string,
@@ -304,7 +303,6 @@ func levelOfAuthenticationMiddleware(
 				req.URL.RawQuery = query.Encode()
 				oauthAuthorizationHandler(
 					lLog,
-					skipTokenVerification,
 					scopes,
 					enablePKCE,
 					false,

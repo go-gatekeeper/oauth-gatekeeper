@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/gogatekeeper/gatekeeper/pkg/apperrors"
 	"github.com/gogatekeeper/gatekeeper/pkg/constant"
 	"github.com/gogatekeeper/gatekeeper/pkg/keycloak/config"
@@ -129,19 +128,18 @@ func TestGetIndentity(t *testing.T) {
 		cfg := newFakeKeycloakConfig()
 		testCase.ProxySettings(cfg)
 
-		p, idp, _ := newTestProxyService(cfg)
+		_, idp, _ := newTestProxyService(cfg)
 		token, err := NewTestToken(idp.getLocation()).GetToken()
 		require.NoError(t, err)
 
 		getIdentity := session.GetIdentity(
-			p.Log,
 			cfg.SkipAuthorizationHeaderIdentity,
 			cfg.EnableEncryptedToken,
 			cfg.ForceEncryptedCookie,
 			cfg.EncryptionKey,
 		)
 
-		user, err := getIdentity(testCase.Request(token), cfg.CookieAccessName, "")
+		rawToken, err := getIdentity(testCase.Request(token), cfg.CookieAccessName, "")
 
 		if err != nil && testCase.Ok {
 			t.Errorf("test case %d should not have errored", idx)
@@ -157,7 +155,7 @@ func TestGetIndentity(t *testing.T) {
 			continue
 		}
 
-		if user.RawToken != token {
+		if rawToken != token {
 			t.Errorf("test case %d the tokens are not the same", idx)
 		}
 	}
@@ -266,9 +264,7 @@ func TestGetUserContext(t *testing.T) {
 	token.addClientRoles("client", []string{"client"})
 	jwtToken, err := token.GetToken()
 	require.NoError(t, err)
-	webToken, err := jwt.ParseSigned(jwtToken, constant.SignatureAlgs[:])
-	require.NoError(t, err)
-	context, err := session.ExtractIdentity(webToken)
+	context, err := session.ExtractIdentity(jwtToken)
 	require.NoError(t, err)
 	assert.NotNil(t, context)
 	assert.Equal(t, "1e11e539-8256-4b3b-bda8-cc0d56cddb48", context.ID)
@@ -283,9 +279,7 @@ func TestGetUserRealmRoleContext(t *testing.T) {
 	token.addRealmRoles(roles)
 	jwtToken, err := token.GetToken()
 	require.NoError(t, err)
-	webToken, err := jwt.ParseSigned(jwtToken, constant.SignatureAlgs[:])
-	require.NoError(t, err)
-	context, err := session.ExtractIdentity(webToken)
+	context, err := session.ExtractIdentity(jwtToken)
 	require.NoError(t, err)
 	assert.NotNil(t, context)
 	assert.Equal(t, "1e11e539-8256-4b3b-bda8-cc0d56cddb48", context.ID)
@@ -300,9 +294,7 @@ func TestUserContextString(t *testing.T) {
 	token := NewTestToken("test")
 	jwtToken, err := token.GetToken()
 	require.NoError(t, err)
-	webToken, err := jwt.ParseSigned(jwtToken, constant.SignatureAlgs[:])
-	require.NoError(t, err)
-	context, err := session.ExtractIdentity(webToken)
+	context, err := session.ExtractIdentity(jwtToken)
 	require.NoError(t, err)
 	assert.NotNil(t, context)
 	assert.NotEmpty(t, context.String())

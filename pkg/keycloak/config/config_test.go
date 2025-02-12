@@ -194,17 +194,6 @@ func TestIsConfig(t *testing.T) {
 		},
 		{
 			Config: &Config{
-				Listen:                ":8080",
-				SkipTokenVerification: true,
-				Upstream:              "http://120.0.0.1",
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   50,
-				TLSMinVersion:         constant.TLS13,
-			},
-			Ok: true,
-		},
-		{
-			Config: &Config{
 				DiscoveryURL:        "http://127.0.0.1:8080",
 				ClientID:            "client",
 				ClientSecret:        "client",
@@ -1175,26 +1164,17 @@ func TestIsTokenVerificationSettingsValid(t *testing.T) {
 		{
 			Name: "ValidTokenVerificationSettings",
 			Config: &Config{
-				SkipTokenVerification: false,
-				ClientID:              "some-client",
-				DiscoveryURL:          "https://somediscoveryurl",
-			},
-			Valid: true,
-		},
-		{
-			Name: "ValidTokenVerificationSettingsSkipVerification",
-			Config: &Config{
-				SkipTokenVerification: true,
+				ClientID:     "some-client",
+				DiscoveryURL: "https://somediscoveryurl",
 			},
 			Valid: true,
 		},
 		{
 			Name: "InValidTokenVerificationSettings",
 			Config: &Config{
-				SkipTokenVerification: false,
-				ClientID:              "some-client",
-				DiscoveryURL:          "https://somediscoveryurl",
-				EnableRefreshTokens:   true,
+				ClientID:            "some-client",
+				DiscoveryURL:        "https://somediscoveryurl",
+				EnableRefreshTokens: true,
 			},
 			Valid: false,
 		},
